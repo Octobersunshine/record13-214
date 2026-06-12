@@ -1,6 +1,7 @@
 import random
+import time
 import threading
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass, field
 
 
@@ -24,14 +25,23 @@ class UserState:
     total_draws: int = 0
     total_wins: int = 0
     consecutive_losses: int = 0
+    cycle_start_time: Optional[float] = None
     prize_history: List[str] = field(default_factory=list)
 
 
 class LotteryService:
-    def __init__(self, prizes: List[Prize], guaranteed_threshold: int = 10):
+    def __init__(
+        self,
+        prizes: List[Prize],
+        guaranteed_threshold: int = 10,
+        guaranteed_period_days: Optional[int] = None,
+        time_func: Callable[[], float] = time.time,
+    ):
         self._validate_prizes(prizes)
         self._prizes = prizes
         self._guaranteed_threshold = guaranteed_threshold
+        self._guaranteed_period_days = guaranteed_period_days
+        self._time_func = time_func
         self._user_states: Dict[str, UserState] = {}
         self._lock = threading.Lock()
 
@@ -74,6 +84,18 @@ class LotteryService:
             return False
         return user_state.consecutive_losses >= self._guaranteed_threshold - 1
 
+    def _is_period_expired(self, user_state: UserState) -> bool:
+        if self._guaranteed_period_days is None:
+            return False
+        if user_state.cycle_start_time is None:
+            return False
+        elapsed = self._time_func() - user_state.cycle_start_time
+        return elapsed > self._guaranteed_period_days * 86400
+
+    def _reset_cycle(self, user_state: UserState) -> None:
+        user_state.consecutive_losses = 0
+        user_state.cycle_start_time = None
+
     def _draw_by_probability(self) -> Prize:
         r = random.random()
         for i, cum_prob in enumerate(self._cumulative_probs):
@@ -86,17 +108,24 @@ class LotteryService:
             user_state = self._get_or_create_user_state(user_id)
             user_state.total_draws += 1
 
+            if self._is_period_expired(user_state):
+                self._reset_cycle(user_state)
+
             if self._should_guarantee(user_state):
                 prize = self._guaranteed_prize
                 user_state.consecutive_losses = 0
+                user_state.cycle_start_time = None
                 user_state.total_wins += 1
             else:
                 prize = self._draw_by_probability()
                 if prize.is_win:
                     user_state.consecutive_losses = 0
+                    user_state.cycle_start_time = None
                     user_state.total_wins += 1
                 else:
                     user_state.consecutive_losses += 1
+                    if user_state.consecutive_losses == 1:
+                        user_state.cycle_start_time = self._time_func()
 
             user_state.prize_history.append(prize.name)
             return prize
@@ -116,6 +145,10 @@ class LotteryService:
     @property
     def guaranteed_threshold(self) -> int:
         return self._guaranteed_threshold
+
+    @property
+    def guaranteed_period_days(self) -> Optional[int]:
+        return self._guaranteed_period_days
 
     @property
     def guaranteed_prize(self) -> Optional[Prize]:

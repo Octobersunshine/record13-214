@@ -187,6 +187,148 @@ class TestLotteryService(unittest.TestCase):
         self.assertIsNotNone(prize.data)
         self.assertIn("amount", prize.data)
 
+    def test_period_expired_resets_counter(self):
+        prizes = [
+            Prize("稀有奖品", 0.001, is_guaranteed=True),
+            Prize("谢谢参与", 0.999, is_win=False),
+        ]
+        threshold = 10
+        period_days = 3
+        now = 1000000.0
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=threshold,
+            guaranteed_period_days=period_days,
+            time_func=lambda: now,
+        )
+
+        user_id = "period_user"
+        for i in range(5):
+            service.draw(user_id)
+
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 5)
+        self.assertIsNotNone(state.cycle_start_time)
+
+        now += period_days * 86400 + 1
+
+        service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 1)
+        self.assertEqual(state.total_draws, 6)
+
+    def test_period_not_expired_keeps_counter(self):
+        prizes = [
+            Prize("稀有奖品", 0.001, is_guaranteed=True),
+            Prize("谢谢参与", 0.999, is_win=False),
+        ]
+        threshold = 10
+        period_days = 3
+        now = 1000000.0
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=threshold,
+            guaranteed_period_days=period_days,
+            time_func=lambda: now,
+        )
+
+        user_id = "within_period_user"
+        for i in range(5):
+            service.draw(user_id)
+
+        now += period_days * 86400 - 1
+
+        service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 6)
+
+    def test_period_resets_after_win(self):
+        prizes = [
+            Prize("稀有奖品", 0.5, is_guaranteed=True),
+            Prize("谢谢参与", 0.5, is_win=False),
+        ]
+        period_days = 3
+        now = 1000000.0
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=10,
+            guaranteed_period_days=period_days,
+            time_func=lambda: now,
+        )
+
+        user_id = "win_reset_user"
+        random.seed(77)
+        service.draw(user_id)
+        service.draw(user_id)
+        state = service.get_user_state(user_id)
+        if state.consecutive_losses == 0:
+            self.assertIsNone(state.cycle_start_time)
+
+        now += 100
+
+        for _ in range(3):
+            service.draw(user_id)
+        state_after = service.get_user_state(user_id)
+        if state_after.consecutive_losses > 0:
+            self.assertIsNotNone(state_after.cycle_start_time)
+
+    def test_backward_compatible_no_period(self):
+        prizes = [
+            Prize("稀有奖品", 0.001, is_guaranteed=True),
+            Prize("谢谢参与", 0.999, is_win=False),
+        ]
+        service = LotteryService(prizes, guaranteed_threshold=5)
+        self.assertIsNone(service.guaranteed_period_days)
+
+        user_id = "compat_user"
+        for i in range(4):
+            service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 4)
+
+        prize = service.draw(user_id)
+        self.assertEqual(prize.name, "稀有奖品")
+
+    def test_period_expired_then_guaranteed_works_in_new_cycle(self):
+        prizes = [
+            Prize("稀有奖品", 0.001, is_guaranteed=True),
+            Prize("谢谢参与", 0.999, is_win=False),
+        ]
+        threshold = 3
+        period_days = 1
+        now = 1000000.0
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=threshold,
+            guaranteed_period_days=period_days,
+            time_func=lambda: now,
+        )
+
+        user_id = "new_cycle_user"
+        service.draw(user_id)
+        service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 2)
+
+        now += period_days * 86400 + 1
+
+        service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 1)
+        self.assertIsNotNone(state.cycle_start_time)
+
+        now += 10
+        service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 2)
+
+        now += 10
+        prize = service.draw(user_id)
+        self.assertEqual(prize.name, "稀有奖品")
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.consecutive_losses, 0)
+        self.assertIsNone(state.cycle_start_time)
+
     def test_thread_safety(self):
         import threading
 
