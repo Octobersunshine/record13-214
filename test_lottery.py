@@ -1,7 +1,7 @@
 import random
 import unittest
 from collections import Counter
-from lottery_service import LotteryService, Prize
+from lottery_service import LotteryService, Prize, DrawAlgorithm
 
 
 class TestLotteryService(unittest.TestCase):
@@ -328,6 +328,144 @@ class TestLotteryService(unittest.TestCase):
         state = service.get_user_state(user_id)
         self.assertEqual(state.consecutive_losses, 0)
         self.assertIsNone(state.cycle_start_time)
+
+    def test_prd_distribution_accuracy(self):
+        prizes = [
+            Prize("一等奖", 0.05),
+            Prize("二等奖", 0.15),
+            Prize("三等奖", 0.30),
+            Prize("谢谢参与", 0.50, is_win=False),
+        ]
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=1000,
+            algorithm=DrawAlgorithm.PRD,
+        )
+
+        num_draws = 100000
+        results = []
+        for i in range(num_draws):
+            prize = service.draw(f"user_{i % 1000}")
+            results.append(prize.name)
+
+        counts = Counter(results)
+
+        actual_win_rate = sum(counts[p.name] for p in prizes if p.is_win) / num_draws
+        expected_win_rate = sum(p.probability for p in prizes if p.is_win)
+        self.assertAlmostEqual(actual_win_rate, expected_win_rate, delta=0.02,
+                               msg=f"Win rate: expected {expected_win_rate}, got {actual_win_rate}")
+
+    def test_prd_c_value(self):
+        prizes = [
+            Prize("中奖", 0.5),
+            Prize("未中奖", 0.5, is_win=False),
+        ]
+        service = LotteryService(prizes, guaranteed_threshold=100, algorithm=DrawAlgorithm.PRD)
+        self.assertGreater(service.prd_c, 0)
+        self.assertLess(service.prd_c, 0.5)
+
+    def test_prd_reduces_long_losing_streaks(self):
+        prizes = [
+            Prize("中奖", 0.1),
+            Prize("未中奖", 0.9, is_win=False),
+        ]
+        threshold = 100
+        num_draws = 50000
+        num_users = 100
+
+        def measure_streaks(algo: DrawAlgorithm) -> list[int]:
+            random.seed(42)
+            service = LotteryService(
+                prizes,
+                guaranteed_threshold=threshold,
+                algorithm=algo,
+            )
+            streaks = []
+            for u in range(num_users):
+                current = 0
+                for _ in range(num_draws // num_users):
+                    prize = service.draw(f"u_{algo.value}_{u}")
+                    if prize.is_win:
+                        streaks.append(current)
+                        current = 0
+                    else:
+                        current += 1
+                streaks.append(current)
+            return streaks
+
+        flat_streaks = measure_streaks(DrawAlgorithm.FLAT)
+        prd_streaks = measure_streaks(DrawAlgorithm.PRD)
+
+        flat_max = max(flat_streaks)
+        prd_max = max(prd_streaks)
+        self.assertLess(prd_max, flat_max,
+                        msg=f"PRD max streak {prd_max} should be < Flat max streak {flat_max}")
+
+        flat_p99 = sorted(flat_streaks)[int(len(flat_streaks) * 0.99)]
+        prd_p99 = sorted(prd_streaks)[int(len(prd_streaks) * 0.99)]
+        self.assertLess(prd_p99, flat_p99,
+                        msg=f"PRD p99 streak {prd_p99} should be < Flat p99 {flat_p99}")
+
+    def test_prd_streak_resets_on_win(self):
+        prizes = [
+            Prize("中奖", 0.0001),
+            Prize("未中奖", 0.9999, is_win=False),
+        ]
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=1000,
+            algorithm=DrawAlgorithm.PRD,
+        )
+        user_id = "reset_check"
+        random.seed(0)
+
+        for _ in range(5):
+            service.draw(user_id)
+        state = service.get_user_state(user_id)
+        self.assertEqual(state.prd_streak, 5)
+
+        for _ in range(10000):
+            prize = service.draw(user_id)
+            state = service.get_user_state(user_id)
+            if prize.is_win:
+                self.assertEqual(state.prd_streak, 0)
+                break
+        else:
+            self.fail("Expected a win within 10000 draws with PRD")
+
+    def test_prd_backward_compatible_default_flat(self):
+        prizes = [
+            Prize("A", 0.5),
+            Prize("B", 0.5),
+        ]
+        service = LotteryService(prizes)
+        self.assertEqual(service.algorithm, DrawAlgorithm.FLAT)
+        self.assertEqual(service.prd_c, 0.0)
+
+    def test_prd_and_guaranteed_coexist(self):
+        prizes = [
+            Prize("稀有", 0.01, is_guaranteed=True),
+            Prize("普通", 0.09),
+            Prize("谢谢", 0.90, is_win=False),
+        ]
+        threshold = 8
+        service = LotteryService(
+            prizes,
+            guaranteed_threshold=threshold,
+            algorithm=DrawAlgorithm.PRD,
+        )
+
+        user_id = "mixed_user"
+        random.seed(12345)
+        max_loss = 0
+        for _ in range(200):
+            prize = service.draw(user_id)
+            state = service.get_user_state(user_id)
+            if state.consecutive_losses > max_loss:
+                max_loss = state.consecutive_losses
+            self.assertLessEqual(state.consecutive_losses, threshold - 1)
+            if prize.is_guaranteed:
+                self.assertEqual(state.consecutive_losses, 0)
 
     def test_thread_safety(self):
         import threading

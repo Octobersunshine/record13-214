@@ -1,8 +1,14 @@
 import random
 import time
 import threading
+from enum import Enum
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass, field
+
+
+class DrawAlgorithm(str, Enum):
+    FLAT = "flat"
+    PRD = "prd"
 
 
 @dataclass
@@ -26,6 +32,7 @@ class UserState:
     total_wins: int = 0
     consecutive_losses: int = 0
     cycle_start_time: Optional[float] = None
+    prd_streak: int = 0
     prize_history: List[str] = field(default_factory=list)
 
 
@@ -36,17 +43,76 @@ class LotteryService:
         guaranteed_threshold: int = 10,
         guaranteed_period_days: Optional[int] = None,
         time_func: Callable[[], float] = time.time,
+        algorithm: DrawAlgorithm = DrawAlgorithm.FLAT,
     ):
         self._validate_prizes(prizes)
         self._prizes = prizes
         self._guaranteed_threshold = guaranteed_threshold
         self._guaranteed_period_days = guaranteed_period_days
         self._time_func = time_func
+        self._algorithm = algorithm
         self._user_states: Dict[str, UserState] = {}
         self._lock = threading.Lock()
 
         self._guaranteed_prize = self._find_guaranteed_prize()
         self._cumulative_probs = self._build_cumulative_probs()
+
+        self._win_prizes, self._win_cumulative = self._build_win_distribution()
+        self._total_win_prob = sum(p.probability for p in self._win_prizes)
+        self._prd_c = self._compute_prd_c(self._total_win_prob) if algorithm == DrawAlgorithm.PRD else 0.0
+
+    def _build_win_distribution(self) -> tuple[List[Prize], List[float]]:
+        win_prizes = [p for p in self._prizes if p.is_win]
+        total = sum(p.probability for p in win_prizes)
+        if total <= 0:
+            return [], []
+        cumulative = []
+        acc = 0.0
+        for p in win_prizes:
+            acc += p.probability / total
+            cumulative.append(acc)
+        return win_prizes, cumulative
+
+    def _sample_win_prize(self) -> Prize:
+        r = random.random()
+        for i, cum in enumerate(self._win_cumulative):
+            if r <= cum:
+                return self._win_prizes[i]
+        return self._win_prizes[-1]
+
+    def _compute_prd_c(self, target_p: float, max_iter: int = 100) -> float:
+        if target_p <= 0:
+            return 0.0
+        if target_p >= 1:
+            return 1.0
+
+        lo = 0.0
+        hi = target_p
+
+        def simulate(c: float) -> float:
+            p_acc = 0.0
+            p_last = 0.0
+            n = 1
+            while True:
+                p_n = min(c * n, 1.0)
+                prob_n_hit = (1.0 - p_last) * p_n
+                p_acc += prob_n_hit * n
+                p_last += prob_n_hit
+                n += 1
+                if p_last >= 1.0 - 1e-15 or n > 100000:
+                    break
+            return 1.0 / p_acc if p_acc > 0 else 0.0
+
+        for _ in range(max_iter):
+            mid = (lo + hi) / 2
+            actual = simulate(mid)
+            if abs(actual - target_p) < 1e-8:
+                return mid
+            if actual < target_p:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
 
     def _validate_prizes(self, prizes: List[Prize]) -> None:
         if not prizes:
@@ -95,13 +161,36 @@ class LotteryService:
     def _reset_cycle(self, user_state: UserState) -> None:
         user_state.consecutive_losses = 0
         user_state.cycle_start_time = None
+        user_state.prd_streak = 0
 
-    def _draw_by_probability(self) -> Prize:
+    def _draw_flat(self) -> Prize:
         r = random.random()
         for i, cum_prob in enumerate(self._cumulative_probs):
             if r <= cum_prob:
                 return self._prizes[i]
         return self._prizes[-1]
+
+    def _draw_prd(self, user_state: UserState) -> Prize:
+        if self._total_win_prob <= 0 or not self._win_prizes:
+            return self._draw_flat()
+
+        user_state.prd_streak += 1
+        current_p = min(self._prd_c * user_state.prd_streak, 1.0)
+
+        r = random.random()
+        if r <= current_p:
+            user_state.prd_streak = 0
+            return self._sample_win_prize()
+        else:
+            for p in self._prizes:
+                if not p.is_win:
+                    return p
+            return self._prizes[-1]
+
+    def _draw_by_probability(self, user_state: UserState) -> Prize:
+        if self._algorithm == DrawAlgorithm.PRD:
+            return self._draw_prd(user_state)
+        return self._draw_flat()
 
     def draw(self, user_id: str) -> Prize:
         with self._lock:
@@ -115,12 +204,14 @@ class LotteryService:
                 prize = self._guaranteed_prize
                 user_state.consecutive_losses = 0
                 user_state.cycle_start_time = None
+                user_state.prd_streak = 0
                 user_state.total_wins += 1
             else:
-                prize = self._draw_by_probability()
+                prize = self._draw_by_probability(user_state)
                 if prize.is_win:
                     user_state.consecutive_losses = 0
                     user_state.cycle_start_time = None
+                    user_state.prd_streak = 0
                     user_state.total_wins += 1
                 else:
                     user_state.consecutive_losses += 1
@@ -153,3 +244,11 @@ class LotteryService:
     @property
     def guaranteed_prize(self) -> Optional[Prize]:
         return self._guaranteed_prize
+
+    @property
+    def algorithm(self) -> DrawAlgorithm:
+        return self._algorithm
+
+    @property
+    def prd_c(self) -> float:
+        return self._prd_c

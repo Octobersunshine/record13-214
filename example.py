@@ -1,4 +1,4 @@
-from lottery_service import LotteryService, Prize
+from lottery_service import LotteryService, Prize, DrawAlgorithm
 
 
 def basic_usage():
@@ -124,8 +124,55 @@ def guaranteed_period_demo():
     print()
 
 
+def prd_comparison_demo():
+    print("=== PRD 伪随机 vs 纯随机 对比 ===")
+
+    prizes = [
+        Prize("稀有道具", 0.01),
+        Prize("普通道具", 0.09),
+        Prize("谢谢参与", 0.90, is_win=False),
+    ]
+    num_draws = 100
+
+    for algo_name, algo in [("纯随机 (Flat)", DrawAlgorithm.FLAT), ("PRD 伪随机", DrawAlgorithm.PRD)]:
+        import random
+        random.seed(42)
+
+        service = LotteryService(prizes, guaranteed_threshold=100, algorithm=algo)
+        if algo == DrawAlgorithm.PRD:
+            target_p = sum(p.probability for p in prizes if p.is_win)
+            print(f"\n  PRD C 值: {service.prd_c:.6f} (目标中奖率: {target_p:.2%})")
+
+        print(f"\n  [{algo_name}] 用户抽奖 100 次 (中奖概率 10%):")
+
+        current_streak = 0
+        max_streak = 0
+        win_count = 0
+        display = []
+
+        for i in range(num_draws):
+            prize = service.draw("demo_user")
+            if prize.is_win:
+                win_count += 1
+                display.append("█")
+                if current_streak > max_streak:
+                    max_streak = current_streak
+                current_streak = 0
+            else:
+                current_streak += 1
+                display.append("·")
+        if current_streak > max_streak:
+            max_streak = current_streak
+
+        print(f"  结果图(█=中奖 ·=未中):\n    {''.join(display[:50])}\n    {''.join(display[50:])}")
+        print(f"  实际中奖率: {win_count / num_draws:.2%} | 最长连续未中: {max_streak} 次")
+
+    print()
+
+
 if __name__ == "__main__":
     basic_usage()
     guaranteed_demo()
     multi_user_demo()
     guaranteed_period_demo()
+    prd_comparison_demo()
